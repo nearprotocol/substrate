@@ -77,7 +77,7 @@ impl<B: BlockT> Verifier<B> for NoneVerifier {
 			body,
 			finalized: true,
 			external_justification: justification,
-			internal_justification: vec![],
+			post_runtime_digests: vec![],
 			auxiliary: Vec::new(),
 		}, None))
 	}
@@ -241,7 +241,7 @@ mod tests {
 			ImportBlock {
 				origin: BlockOrigin::File,
 				external_justification: Vec::new(),
-				internal_justification: Vec::new(),
+				post_runtime_digests: Vec::new(),
 				finalized: true,
 				body: Some(block.extrinsics),
 				header: block.header,
