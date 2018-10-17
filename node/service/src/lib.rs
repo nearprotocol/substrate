@@ -21,8 +21,8 @@
 extern crate node_primitives;
 extern crate node_runtime;
 extern crate node_executor;
-extern crate node_network;
 extern crate substrate_client as client;
+#[macro_use]
 extern crate substrate_network as network;
 extern crate substrate_primitives as primitives;
 extern crate substrate_service as service;
@@ -43,7 +43,6 @@ use transaction_pool::txpool::{Pool as TransactionPool};
 use node_primitives::{Block, Hash};
 use node_runtime::GenesisConfig;
 use client::Client;
-use node_network::Protocol as DemoProtocol;
 use tokio::runtime::TaskExecutor;
 use service::FactoryFullConfiguration;
 use network::import_queue::{BasicQueue, BlockOrigin, ImportBlock, Verifier};
@@ -59,6 +58,11 @@ pub type ChainSpec = service::ChainSpec<GenesisConfig>;
 /// Client type for specialised `Components`.
 pub type ComponentClient<C> = Client<<C as Components>::Backend, <C as Components>::Executor, Block>;
 pub type NetworkService = network::Service<Block, <Factory as service::ServiceFactory>::NetworkProtocol, Hash>;
+
+construct_simple_protocol! {
+	/// Demo protocol attachment for substrate.
+	pub struct Protocol where Block = Block { }
+}
 
 /// A verifier that doesn't actually do any checks
 pub struct NoneVerifier;
@@ -118,7 +122,7 @@ pub struct Factory;
 impl service::ServiceFactory for Factory {
 	type Block = Block;
 	type ExtrinsicHash = Hash;
-	type NetworkProtocol = DemoProtocol;
+	type NetworkProtocol = Protocol;
 	type RuntimeDispatch = node_executor::Executor;
 	type FullTransactionPoolApi = transaction_pool::ChainApi<service::FullBackend<Self>, service::FullExecutor<Self>, Block>;
 	type LightTransactionPoolApi = transaction_pool::ChainApi<service::LightBackend<Self>, service::LightExecutor<Self>, Block>;
@@ -142,9 +146,9 @@ impl service::ServiceFactory for Factory {
 	}
 
 	fn build_network_protocol(_config: &Configuration)
-		-> Result<DemoProtocol, Error>
+		-> Result<Protocol, Error>
 	{
-		Ok(DemoProtocol::new())
+		Ok(Protocol::new())
 	}
 
 	fn build_full_import_queue(

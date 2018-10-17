@@ -8,9 +8,7 @@ error-chain = "0.12"
 hex-literal = "0.1"
 lazy_static = "1.0"
 log = "0.4"
-node-consensus = { path = "../consensus" }
 node-executor = { path = "../executor" }
-node-network = { path = "../network" }
 node-primitives = { path = "../primitives" }
 node-runtime = { path = "../runtime" }
 parity-codec = { version = "2.1" }
