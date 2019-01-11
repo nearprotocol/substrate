@@ -42,6 +42,7 @@ use primitives::traits::{As, Zero, One, Convert};
 use codec::HasCompact;
 use runtime_support::{StorageValue, StorageMap};
 use runtime_support::dispatch::Result;
+use runtime_support::for_each_tuple;
 use system::ensure_signed;
 use rstd::ops::Mul;
 
@@ -51,9 +52,23 @@ pub trait OnSessionChange<T> {
 	fn on_session_change(time_elapsed: T, should_reward: bool);
 }
 
-impl<T> OnSessionChange<T> for () {
-	fn on_session_change(_: T, _: bool) {}
+macro_rules! impl_session_change {
+	() => (
+		impl<T> OnSessionChange<T> for () {
+			fn on_session_change(_: T, _: bool) {}
+		}
+	);
+
+	( $($t:ident)* ) => {
+		impl<T: Clone, $($t: OnSessionChange<T>),*> OnSessionChange<T> for ($($t,)*) {
+			fn on_session_change(time_elapsed: T, should_reward: bool) {
+				$($t::on_session_change(time_elapsed.clone(), should_reward);)*
+			}
+		}
+	}
 }
+
+for_each_tuple!(impl_session_change);
 
 pub trait Trait: timestamp::Trait {
 	type ConvertAccountIdToSessionKey: Convert<Self::AccountId, Self::SessionKey>;
@@ -63,21 +78,19 @@ pub trait Trait: timestamp::Trait {
 
 decl_module! {
 	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
-		fn deposit_event() = default;
+		fn deposit_event<T>() = default;
 
 		/// Sets the session key of `_validator` to `_key`. This doesn't take effect until the next
 		/// session.
-		fn set_key(origin, key: T::SessionKey) -> Result {
+		fn set_key(origin, key: T::SessionKey) {
 			let who = ensure_signed(origin)?;
 			// set new value for next session
 			<NextKeyFor<T>>::insert(who, key);
-			Ok(())
 		}
 
 		/// Set a new session length. Won't kick in until the next session change (at current length).
-		fn set_length(new: <T::BlockNumber as HasCompact>::Type) -> Result {
+		fn set_length(new: <T::BlockNumber as HasCompact>::Type) {
 			<NextSessionLength<T>>::put(new.into());
-			Ok(())
 		}
 
 		/// Forces a new session.
@@ -224,8 +237,8 @@ mod tests {
 	use runtime_io::with_externalities;
 	use substrate_primitives::{H256, Blake2Hasher};
 	use primitives::BuildStorage;
-	use primitives::traits::{Identity, BlakeTwo256};
-	use primitives::testing::{Digest, DigestItem, Header};
+	use primitives::traits::BlakeTwo256;
+	use primitives::testing::{Digest, DigestItem, Header, UintAuthorityId, ConvertUintAuthorityId};
 
 	impl_outer_origin!{
 		pub enum Origin for Test {}
@@ -236,8 +249,8 @@ mod tests {
 	impl consensus::Trait for Test {
 		const NOTE_OFFLINE_POSITION: u32 = 1;
 		type Log = DigestItem;
-		type SessionKey = u64;
-		type OnOfflineValidator = ();
+		type SessionKey = UintAuthorityId;
+		type InherentOfflineReport = ();
 	}
 	impl system::Trait for Test {
 		type Origin = Origin;
@@ -254,9 +267,10 @@ mod tests {
 	impl timestamp::Trait for Test {
 		const TIMESTAMP_SET_POSITION: u32 = 0;
 		type Moment = u64;
+		type OnTimestampSet = ();
 	}
 	impl Trait for Test {
-		type ConvertAccountIdToSessionKey = Identity;
+		type ConvertAccountIdToSessionKey = ConvertUintAuthorityId;
 		type OnSessionChange = ();
 		type Event = ();
 	}
@@ -269,7 +283,7 @@ mod tests {
 		let mut t = system::GenesisConfig::<Test>::default().build_storage().unwrap().0;
 		t.extend(consensus::GenesisConfig::<Test>{
 			code: vec![],
-			authorities: vec![1, 2, 3],
+			authorities: vec![UintAuthorityId(1), UintAuthorityId(2), UintAuthorityId(3)],
 		}.build_storage().unwrap().0);
 		t.extend(timestamp::GenesisConfig::<Test>{
 			period: 5,
@@ -284,7 +298,7 @@ mod tests {
 	#[test]
 	fn simple_setup_should_work() {
 		with_externalities(&mut new_test_ext(), || {
-			assert_eq!(Consensus::authorities(), vec![1, 2, 3]);
+			assert_eq!(Consensus::authorities(), vec![UintAuthorityId(1).into(), UintAuthorityId(2).into(), UintAuthorityId(3).into()]);
 			assert_eq!(Session::length(), 2);
 			assert_eq!(Session::validators(), vec![1, 2, 3]);
 		});
@@ -380,25 +394,25 @@ mod tests {
 			// Block 1: No change
 			System::set_block_number(1);
 			Session::check_rotate_session(1);
-			assert_eq!(Consensus::authorities(), vec![1, 2, 3]);
+			assert_eq!(Consensus::authorities(), vec![UintAuthorityId(1), UintAuthorityId(2), UintAuthorityId(3)]);
 
 			// Block 2: Session rollover, but no change.
 			System::set_block_number(2);
 			Session::check_rotate_session(2);
-			assert_eq!(Consensus::authorities(), vec![1, 2, 3]);
+			assert_eq!(Consensus::authorities(), vec![UintAuthorityId(1), UintAuthorityId(2), UintAuthorityId(3)]);
 
 			// Block 3: Set new key for validator 2; no visible change.
 			System::set_block_number(3);
-			assert_ok!(Session::set_key(Origin::signed(2), 5));
-			assert_eq!(Consensus::authorities(), vec![1, 2, 3]);
+			assert_ok!(Session::set_key(Origin::signed(2), UintAuthorityId(5)));
+			assert_eq!(Consensus::authorities(), vec![UintAuthorityId(1), UintAuthorityId(2), UintAuthorityId(3)]);
 
 			Session::check_rotate_session(3);
-			assert_eq!(Consensus::authorities(), vec![1, 2, 3]);
+			assert_eq!(Consensus::authorities(), vec![UintAuthorityId(1), UintAuthorityId(2), UintAuthorityId(3)]);
 
 			// Block 4: Session rollover, authority 2 changes.
 			System::set_block_number(4);
 			Session::check_rotate_session(4);
-			assert_eq!(Consensus::authorities(), vec![1, 5, 3]);
+			assert_eq!(Consensus::authorities(), vec![UintAuthorityId(1), UintAuthorityId(5), UintAuthorityId(3)]);
 		});
 	}
 }

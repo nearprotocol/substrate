@@ -22,10 +22,10 @@ use parking_lot::RwLock;
 use error;
 use backend::{self, NewBlockState};
 use light;
-use primitives::{AuthorityId, storage::well_known_keys};
+use primitives::storage::well_known_keys;
 use runtime_primitives::generic::BlockId;
 use runtime_primitives::traits::{Block as BlockT, Header as HeaderT, Zero,
-	NumberFor, As, Digest, DigestItem};
+	NumberFor, As, Digest, DigestItem, AuthorityIdFor};
 use runtime_primitives::{Justification, StorageMap, ChildrenStorageMap};
 use blockchain::{self, BlockStatus, HeaderBackend};
 use state_machine::backend::{Backend as StateBackend, InMemory, Consolidate};
@@ -97,6 +97,7 @@ struct BlockchainStorage<Block: BlockT> {
 	header_cht_roots: HashMap<NumberFor<Block>, Block::Hash>,
 	changes_trie_cht_roots: HashMap<NumberFor<Block>, Block::Hash>,
 	leaves: LeafSet<Block::Hash, NumberFor<Block>>,
+	aux: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 /// In-memory blockchain. Supports concurrent reads.
@@ -107,7 +108,7 @@ pub struct Blockchain<Block: BlockT> {
 
 struct Cache<Block: BlockT> {
 	storage: Arc<RwLock<BlockchainStorage<Block>>>,
-	authorities_at: RwLock<HashMap<Block::Hash, Option<Vec<AuthorityId>>>>,
+	authorities_at: RwLock<HashMap<Block::Hash, Option<Vec<AuthorityIdFor<Block>>>>>,
 }
 
 impl<Block: BlockT + Clone> Clone for Blockchain<Block> {
@@ -146,6 +147,7 @@ impl<Block: BlockT> Blockchain<Block> {
 				header_cht_roots: HashMap::new(),
 				changes_trie_cht_roots: HashMap::new(),
 				leaves: LeafSet::new(),
+				aux: HashMap::new(),
 			}));
 		Blockchain {
 			storage: storage.clone(),
@@ -240,14 +242,37 @@ impl<Block: BlockT> Blockchain<Block> {
 		self.storage.write().header_cht_roots.insert(block, cht_root);
 	}
 
-	fn finalize_header(&self, id: BlockId<Block>) -> error::Result<()> {
+	fn finalize_header(&self, id: BlockId<Block>, justification: Option<Justification>) -> error::Result<()> {
 		let hash = match self.header(id)? {
 			Some(h) => h.hash(),
 			None => return Err(error::ErrorKind::UnknownBlock(format!("{}", id)).into()),
 		};
 
-		self.storage.write().finalized_hash = hash;
+		let mut storage = self.storage.write();
+		storage.finalized_hash = hash;
+
+		if justification.is_some() {
+			let block = storage.blocks.get_mut(&hash)
+				.expect("hash was fetched from a block in the db; qed");
+
+			let block_justification = match block {
+				StoredBlock::Header(_, ref mut j) | StoredBlock::Full(_, ref mut j) => j
+			};
+
+			*block_justification = justification;
+		}
+
 		Ok(())
+	}
+
+	fn write_aux(&self, ops: Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+		let mut storage = self.storage.write();
+		for (k, v) in ops {
+			match v {
+				Some(v) => storage.aux.insert(k, v),
+				None => storage.aux.remove(&k),
+			};
+		}
 	}
 }
 
@@ -313,6 +338,29 @@ impl<Block: BlockT> blockchain::Backend<Block> for Blockchain<Block> {
 	}
 }
 
+impl<Block: BlockT> backend::AuxStore for Blockchain<Block> {
+	fn insert_aux<
+		'a,
+		'b: 'a,
+		'c: 'a,
+		I: IntoIterator<Item=&'a(&'c [u8], &'c [u8])>,
+		D: IntoIterator<Item=&'a &'b [u8]>,
+	>(&self, insert: I, delete: D) -> error::Result<()> {
+		let mut storage = self.storage.write();
+		for (k, v) in insert {
+			storage.aux.insert(k.to_vec(), v.to_vec());
+		}
+		for k in delete {
+			storage.aux.remove(*k);
+		}
+		Ok(())
+	}
+
+	fn get_aux(&self, key: &[u8]) -> error::Result<Option<Vec<u8>>> {
+		Ok(self.storage.read().aux.get(key).cloned())
+	}
+}
+
 impl<Block: BlockT> light::blockchain::Storage<Block> for Blockchain<Block>
 	where
 		Block::Hash: From<[u8; 32]>,
@@ -320,8 +368,9 @@ impl<Block: BlockT> light::blockchain::Storage<Block> for Blockchain<Block>
 	fn import_header(
 		&self,
 		header: Block::Header,
-		authorities: Option<Vec<AuthorityId>>,
+		authorities: Option<Vec<AuthorityIdFor<Block>>>,
 		state: NewBlockState,
+		aux_ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 	) -> error::Result<()> {
 		let hash = header.hash();
 		let parent_hash = *header.parent_hash();
@@ -330,6 +379,7 @@ impl<Block: BlockT> light::blockchain::Storage<Block> for Blockchain<Block>
 			self.cache.insert(parent_hash, authorities);
 		}
 
+		self.write_aux(aux_ops);
 		Ok(())
 	}
 
@@ -338,7 +388,7 @@ impl<Block: BlockT> light::blockchain::Storage<Block> for Blockchain<Block>
 	}
 
 	fn finalize_header(&self, id: BlockId<Block>) -> error::Result<()> {
-		Blockchain::finalize_header(self, id)
+		Blockchain::finalize_header(self, id, None)
 	}
 
 	fn header_cht_root(&self, _cht_size: u64, block: NumberFor<Block>) -> error::Result<Block::Hash> {
@@ -359,10 +409,11 @@ impl<Block: BlockT> light::blockchain::Storage<Block> for Blockchain<Block>
 /// In-memory operation.
 pub struct BlockImportOperation<Block: BlockT, H: Hasher> {
 	pending_block: Option<PendingBlock<Block>>,
-	pending_authorities: Option<Vec<AuthorityId>>,
+	pending_authorities: Option<Vec<AuthorityIdFor<Block>>>,
 	old_state: InMemory<H>,
 	new_state: Option<InMemory<H>>,
 	changes_trie_update: Option<MemoryDB<H>>,
+	aux: Option<Vec<(Vec<u8>, Option<Vec<u8>>)>>,
 }
 
 impl<Block, H> backend::BlockImportOperation<Block, H> for BlockImportOperation<Block, H>
@@ -393,11 +444,11 @@ where
 		Ok(())
 	}
 
-	fn update_authorities(&mut self, authorities: Vec<AuthorityId>) {
+	fn update_authorities(&mut self, authorities: Vec<AuthorityIdFor<Block>>) {
 		self.pending_authorities = Some(authorities);
 	}
 
-	fn update_storage(&mut self, update: <InMemory<H> as StateBackend<H>>::Transaction) -> error::Result<()> {
+	fn update_db_storage(&mut self, update: <InMemory<H> as StateBackend<H>>::Transaction) -> error::Result<()> {
 		self.new_state = Some(self.old_state.update(update));
 		Ok(())
 	}
@@ -433,6 +484,17 @@ where
 		self.new_state = Some(InMemory::from(transaction));
 		Ok(root)
 	}
+
+	fn set_aux<I>(&mut self, ops: I) -> error::Result<()>
+		where I: IntoIterator<Item=(Vec<u8>, Option<Vec<u8>>)>
+	{
+		self.aux = Some(ops.into_iter().collect());
+		Ok(())
+	}
+
+	fn update_storage(&mut self, _update: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> error::Result<()> {
+		Ok(())
+	}
 }
 
 /// In-memory backend. Keeps all states and blocks in memory. Useful for testing.
@@ -445,7 +507,6 @@ where
 	states: RwLock<HashMap<Block::Hash, InMemory<H>>>,
 	changes_trie_storage: InMemoryChangesTrieStorage<H>,
 	blockchain: Blockchain<Block>,
-	aux: RwLock<HashMap<Vec<u8>, Vec<u8>>>,
 }
 
 impl<Block, H> Backend<Block, H>
@@ -460,8 +521,28 @@ where
 			states: RwLock::new(HashMap::new()),
 			changes_trie_storage: InMemoryChangesTrieStorage::new(),
 			blockchain: Blockchain::new(),
-			aux: RwLock::new(HashMap::new()),
 		}
+	}
+}
+
+impl<Block, H> backend::AuxStore for Backend<Block, H>
+where
+	Block: BlockT,
+	H: Hasher<Out=Block::Hash>,
+	H::Out: HeapSizeOf + Ord,
+{
+	fn insert_aux<
+		'a,
+		'b: 'a,
+		'c: 'a,
+		I: IntoIterator<Item=&'a(&'c [u8], &'c [u8])>,
+		D: IntoIterator<Item=&'a &'b [u8]>,
+	>(&self, insert: I, delete: D) -> error::Result<()> {
+		self.blockchain.insert_aux(insert, delete)
+	}
+
+	fn get_aux(&self, key: &[u8]) -> error::Result<Option<Vec<u8>>> {
+		self.blockchain.get_aux(key)
 	}
 }
 
@@ -488,6 +569,7 @@ where
 			old_state: state,
 			new_state: None,
 			changes_trie_update: None,
+			aux: None,
 		})
 	}
 
@@ -515,11 +597,15 @@ where
 				self.blockchain.cache.insert(parent_hash, operation.pending_authorities);
 			}
 		}
+
+		if let Some(ops) = operation.aux {
+			self.blockchain.write_aux(ops);
+		}
 		Ok(())
 	}
 
-	fn finalize_block(&self, block: BlockId<Block>) -> error::Result<()> {
-		self.blockchain.finalize_header(block)
+	fn finalize_block(&self, block: BlockId<Block>, justification: Option<Justification>) -> error::Result<()> {
+		self.blockchain.finalize_header(block, justification)
 	}
 
 	fn blockchain(&self) -> &Self::Blockchain {
@@ -540,21 +626,6 @@ where
 	fn revert(&self, _n: NumberFor<Block>) -> error::Result<NumberFor<Block>> {
 		Ok(As::sa(0))
 	}
-
-	fn insert_aux<'a, 'b: 'a, 'c: 'a, I: IntoIterator<Item=&'a (&'c [u8], &'c [u8])>, D: IntoIterator<Item=&'a &'b [u8]>>(&self, insert: I, delete: D) -> error::Result<()> {
-		let mut aux = self.aux.write();
-		for (k, v) in insert {
-			aux.insert(k.to_vec(), v.to_vec());
-		}
-		for k in delete {
-			aux.remove(*k);
-		}
-		Ok(())
-	}
-
-	fn get_aux(&self, key: &[u8]) -> error::Result<Option<Vec<u8>>> {
-		Ok(self.aux.read().get(key).cloned())
-	}
 }
 
 impl<Block, H> backend::LocalBackend<Block, H> for Backend<Block, H>
@@ -565,13 +636,13 @@ where
 {}
 
 impl<Block: BlockT> Cache<Block> {
-	fn insert(&self, at: Block::Hash, authorities: Option<Vec<AuthorityId>>) {
+	fn insert(&self, at: Block::Hash, authorities: Option<Vec<AuthorityIdFor<Block>>>) {
 		self.authorities_at.write().insert(at, authorities);
 	}
 }
 
 impl<Block: BlockT> blockchain::Cache<Block> for Cache<Block> {
-	fn authorities_at(&self, block: BlockId<Block>) -> Option<Vec<AuthorityId>> {
+	fn authorities_at(&self, block: BlockId<Block>) -> Option<Vec<AuthorityIdFor<Block>>> {
 		let hash = match block {
 			BlockId::Hash(hash) => hash,
 			BlockId::Number(number) => self.storage.read().hashes.get(&number).cloned()?,
@@ -585,7 +656,7 @@ impl<Block: BlockT> blockchain::Cache<Block> for Cache<Block> {
 pub fn cache_authorities_at<Block: BlockT>(
 	blockchain: &Blockchain<Block>,
 	at: Block::Hash,
-	authorities: Option<Vec<AuthorityId>>
+	authorities: Option<Vec<AuthorityIdFor<Block>>>
 ) {
 	blockchain.cache.insert(at, authorities);
 }

@@ -46,18 +46,39 @@ extern crate sr_primitives as runtime_primitives;
 extern crate srml_system as system;
 extern crate srml_consensus as consensus;
 extern crate parity_codec as codec;
-#[macro_use]
-extern crate parity_codec_derive;
 
 use codec::HasCompact;
 use runtime_support::{StorageValue, Parameter};
-use runtime_support::dispatch::Result;
-use runtime_primitives::RuntimeString;
+use runtime_primitives::CheckInherentError;
 use runtime_primitives::traits::{
 	As, SimpleArithmetic, Zero, ProvideInherent, Block as BlockT, Extrinsic
 };
 use system::ensure_inherent;
 use rstd::{result, ops::{Mul, Div}, vec::Vec};
+use runtime_support::for_each_tuple;
+
+/// A trait which is called when the timestamp is set.
+pub trait OnTimestampSet<Moment> {
+	fn on_timestamp_set(moment: Moment);
+}
+
+macro_rules! impl_timestamp_set {
+	() => (
+		impl<Moment> OnTimestampSet<Moment> for () {
+			fn on_timestamp_set(_: Moment) {}
+		}
+	);
+
+	( $($t:ident)* ) => {
+		impl<Moment: Clone, $($t: OnTimestampSet<Moment>),*> OnTimestampSet<Moment> for ($($t,)*) {
+			fn on_timestamp_set(moment: Moment) {
+				$($t::on_timestamp_set(moment.clone());)*
+			}
+		}
+	}
+}
+
+for_each_tuple!(impl_timestamp_set);
 
 pub trait Trait: consensus::Trait + system::Trait {
 	/// The position of the required timestamp-set extrinsic.
@@ -65,6 +86,8 @@ pub trait Trait: consensus::Trait + system::Trait {
 
 	/// Type used for expressing timestamp.
 	type Moment: Parameter + Default + SimpleArithmetic + Mul<Self::BlockNumber, Output = Self::Moment> + Div<Self::BlockNumber, Output = Self::Moment>;
+	/// Something which can be notified when the timestamp is set. Set this to `()` if not needed.
+	type OnTimestampSet: OnTimestampSet<Self::Moment>;
 }
 
 decl_module! {
@@ -77,7 +100,7 @@ decl_module! {
 		/// if this call hasn't been invoked by that time.
 		///
 		/// The timestamp should be greater than the previous one by the amount specified by `block_period`.
-		fn set(origin, now: <T::Moment as HasCompact>::Type) -> Result {
+		fn set(origin, now: <T::Moment as HasCompact>::Type) {
 			ensure_inherent(origin)?;
 			let now = now.into();
 
@@ -91,9 +114,10 @@ decl_module! {
 				Self::now().is_zero() || now >= Self::now() + Self::block_period(),
 				"Timestamp must increment by at least <BlockPeriod> between sequential blocks"
 			);
-			<Self as Store>::Now::put(now);
+			<Self as Store>::Now::put(now.clone());
 			<Self as Store>::DidUpdate::put(true);
-			Ok(())
+
+			<T::OnTimestampSet as OnTimestampSet<_>>::on_timestamp_set(now);
 		}
 
 		fn on_finalise() {
@@ -131,37 +155,33 @@ impl<T: Trait> Module<T> {
 	}
 }
 
-#[derive(Encode)]
-#[cfg_attr(feature = "std", derive(Decode))]
-pub enum InherentError {
-	Other(RuntimeString),
-	TimestampInFuture(u64),
-}
-
 impl<T: Trait> ProvideInherent for Module<T> {
 	type Inherent = T::Moment;
 	type Call = Call<T>;
-	type Error = InherentError;
 
 	fn create_inherent_extrinsics(data: Self::Inherent) -> Vec<(u32, Self::Call)> {
-		vec![(T::TIMESTAMP_SET_POSITION, Call::set(data.into()))]
+		let next_time = ::rstd::cmp::max(data, Self::now() + Self::block_period());
+		vec![(T::TIMESTAMP_SET_POSITION, Call::set(next_time.into()))]
 	}
 
 	fn check_inherent<Block: BlockT, F: Fn(&Block::Extrinsic) -> Option<&Self::Call>>(
 			block: &Block, data: Self::Inherent, extract_function: &F
-	) -> result::Result<(), Self::Error> {
+	) -> result::Result<(), CheckInherentError> {
 		const MAX_TIMESTAMP_DRIFT: u64 = 60;
 
 		let xt = block.extrinsics().get(T::TIMESTAMP_SET_POSITION as usize)
-			.ok_or_else(|| InherentError::Other("No valid timestamp inherent in block".into()))?;
+			.ok_or_else(|| CheckInherentError::Other("No valid timestamp inherent in block".into()))?;
 
 		let t = match (xt.is_signed(), extract_function(&xt)) {
 			(Some(false), Some(Call::set(ref t))) => t.clone(),
-			_ => return Err(InherentError::Other("No valid timestamp inherent in block".into())),
+			_ => return Err(CheckInherentError::Other("No valid timestamp inherent in block".into())),
 		}.into().as_();
 
+		let minimum = (Self::now() + Self::block_period()).as_();
 		if t > data.as_() + MAX_TIMESTAMP_DRIFT {
-			Err(InherentError::TimestampInFuture(t))
+			Err(CheckInherentError::Other("Timestamp too far in future to accept".into()))
+		} else if t < minimum {
+			Err(CheckInherentError::ValidAtTimestamp(minimum))
 		} else {
 			Ok(())
 		}
@@ -176,7 +196,7 @@ mod tests {
 	use substrate_primitives::H256;
 	use runtime_primitives::BuildStorage;
 	use runtime_primitives::traits::BlakeTwo256;
-	use runtime_primitives::testing::{Digest, DigestItem, Header};
+	use runtime_primitives::testing::{Digest, DigestItem, Header, UintAuthorityId};
 
 	impl_outer_origin! {
 		pub enum Origin for Test {}
@@ -199,19 +219,22 @@ mod tests {
 	impl consensus::Trait for Test {
 		const NOTE_OFFLINE_POSITION: u32 = 1;
 		type Log = DigestItem;
-		type SessionKey = u64;
-		type OnOfflineValidator = ();
+		type SessionKey = UintAuthorityId;
+		type InherentOfflineReport = ();
 	}
 	impl Trait for Test {
 		const TIMESTAMP_SET_POSITION: u32 = 0;
 		type Moment = u64;
+		type OnTimestampSet = ();
 	}
 	type Timestamp = Module<Test>;
 
 	#[test]
 	fn timestamp_works() {
 		let mut t = system::GenesisConfig::<Test>::default().build_storage().unwrap().0;
-		t.extend(GenesisConfig::<Test> { period: 0 }.build_storage().unwrap().0);
+		t.extend(GenesisConfig::<Test> {
+			period: 5,
+		}.build_storage().unwrap().0);
 
 		with_externalities(&mut TestExternalities::new(t), || {
 			Timestamp::set_timestamp(42);
@@ -224,7 +247,9 @@ mod tests {
 	#[should_panic(expected = "Timestamp must be updated only once in the block")]
 	fn double_timestamp_should_fail() {
 		let mut t = system::GenesisConfig::<Test>::default().build_storage().unwrap().0;
-		t.extend(GenesisConfig::<Test> { period: 5 }.build_storage().unwrap().0);
+		t.extend(GenesisConfig::<Test> {
+			period: 5,
+		}.build_storage().unwrap().0);
 
 		with_externalities(&mut TestExternalities::new(t), || {
 			Timestamp::set_timestamp(42);
@@ -237,7 +262,9 @@ mod tests {
 	#[should_panic(expected = "Timestamp must increment by at least <BlockPeriod> between sequential blocks")]
 	fn block_period_is_enforced() {
 		let mut t = system::GenesisConfig::<Test>::default().build_storage().unwrap().0;
-		t.extend(GenesisConfig::<Test> { period: 5 }.build_storage().unwrap().0);
+		t.extend(GenesisConfig::<Test> {
+			period: 5,
+		}.build_storage().unwrap().0);
 
 		with_externalities(&mut TestExternalities::new(t), || {
 			Timestamp::set_timestamp(42);

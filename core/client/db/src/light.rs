@@ -21,28 +21,29 @@ use parking_lot::RwLock;
 
 use kvdb::{KeyValueDB, DBTransaction};
 
-use client::backend::NewBlockState;
+use client::backend::{AuxStore, NewBlockState};
 use client::blockchain::{BlockStatus, Cache as BlockchainCache,
 	HeaderBackend as BlockchainHeaderBackend, Info as BlockchainInfo};
 use client::{cht, LeafSet};
 use client::error::{ErrorKind as ClientErrorKind, Result as ClientResult};
 use client::light::blockchain::Storage as LightBlockchainStorage;
 use codec::{Decode, Encode};
-use primitives::{AuthorityId, Blake2Hasher};
+use primitives::Blake2Hasher;
 use runtime_primitives::generic::BlockId;
 use runtime_primitives::traits::{Block as BlockT, Header as HeaderT,
-	Zero, One, As, NumberFor, Digest, DigestItem};
+	Zero, One, As, NumberFor, Digest, DigestItem, AuthorityIdFor};
 use cache::{DbCacheSync, DbCache, ComplexBlockId};
-use utils::{meta_keys, Meta, db_err, number_to_lookup_key, open_database,
+use utils::{meta_keys, Meta, db_err, open_database,
 	read_db, block_id_to_lookup_key, read_meta};
 use DatabaseSettings;
 
 pub(crate) mod columns {
 	pub const META: Option<u32> = ::utils::COLUMN_META;
-	pub const HASH_LOOKUP: Option<u32> = Some(1);
+	pub const KEY_LOOKUP: Option<u32> = Some(1);
 	pub const HEADER: Option<u32> = Some(2);
 	pub const CACHE: Option<u32> = Some(3);
 	pub const CHT: Option<u32> = Some(4);
+	pub const AUX: Option<u32> = Some(5);
 }
 
 /// Prefix for headers CHT.
@@ -57,14 +58,6 @@ pub struct LightStorage<Block: BlockT> {
 	meta: RwLock<Meta<NumberFor<Block>, Block::Hash>>,
 	leaves: RwLock<LeafSet<Block::Hash, NumberFor<Block>>>,
 	cache: DbCacheSync<Block>,
-}
-
-#[derive(Clone, PartialEq, Debug)]
-struct BestAuthorities<N> {
-	/// first block, when this set became actual
-	valid_from: N,
-	/// None means that we do not know the set starting from `valid_from` block
-	authorities: Option<Vec<AuthorityId>>,
 }
 
 impl<Block> LightStorage<Block>
@@ -92,7 +85,7 @@ impl<Block> LightStorage<Block>
 		let leaves = LeafSet::read_from_db(&*db, columns::META, meta_keys::LEAF_PREFIX)?;
 		let cache = DbCache::new(
 			db.clone(),
-			columns::HASH_LOOKUP,
+			columns::KEY_LOOKUP,
 			columns::HEADER,
 			columns::CACHE,
 			ComplexBlockId::new(meta.finalized_hash, meta.finalized_number),
@@ -120,7 +113,7 @@ impl<Block> LightStorage<Block>
 	) {
 		let mut meta = self.meta.write();
 
-		if number == Zero::zero() {
+		if number.is_zero() {
 			meta.genesis_hash = hash;
 			meta.finalized_hash = hash;
 		}
@@ -142,7 +135,7 @@ impl<Block> BlockchainHeaderBackend<Block> for LightStorage<Block>
 		Block: BlockT,
 {
 	fn header(&self, id: BlockId<Block>) -> ClientResult<Option<Block::Header>> {
-		::utils::read_header(&*self.db, columns::HASH_LOOKUP, columns::HEADER, id)
+		::utils::read_header(&*self.db, columns::KEY_LOOKUP, columns::HEADER, id)
 	}
 
 	fn info(&self) -> ClientResult<BlockchainInfo<Block>> {
@@ -160,7 +153,7 @@ impl<Block> BlockchainHeaderBackend<Block> for LightStorage<Block>
 		let exists = match id {
 			BlockId::Hash(_) => read_db(
 				&*self.db,
-				columns::HASH_LOOKUP,
+				columns::KEY_LOOKUP,
 				columns::HEADER,
 				id
 			)?.is_some(),
@@ -173,7 +166,7 @@ impl<Block> BlockchainHeaderBackend<Block> for LightStorage<Block>
 	}
 
 	fn number(&self, hash: Block::Hash) -> ClientResult<Option<NumberFor<Block>>> {
-		if let Some(lookup_key) = block_id_to_lookup_key::<Block>(&*self.db, columns::HASH_LOOKUP, BlockId::Hash(hash))? {
+		if let Some(lookup_key) = block_id_to_lookup_key::<Block>(&*self.db, columns::KEY_LOOKUP, BlockId::Hash(hash))? {
 			let number = ::utils::lookup_key_to_number(&lookup_key)?;
 			Ok(Some(number))
 		} else {
@@ -210,7 +203,7 @@ impl<Block: BlockT> LightStorage<Block> {
 			).into())
 		}
 
-		let lookup_key = ::utils::number_to_lookup_key(header.number().clone());
+		let lookup_key = ::utils::number_and_hash_to_lookup_key(header.number().clone(), hash);
 		transaction.put(columns::META, meta_keys::FINALIZED_BLOCK, &lookup_key);
 
 		// build new CHT(s) if required
@@ -248,9 +241,14 @@ impl<Block: BlockT> LightStorage<Block> {
 
 			while prune_block <= new_cht_end {
 				if let Some(hash) = self.hash(prune_block)? {
-					let lookup_key = block_id_to_lookup_key::<Block>(&*self.db, columns::HASH_LOOKUP, BlockId::Number(prune_block))?
+					let lookup_key = block_id_to_lookup_key::<Block>(&*self.db, columns::KEY_LOOKUP, BlockId::Number(prune_block))?
 						.expect("retrieved hash for `prune_block` right above. therefore retrieving lookup key must succeed. q.e.d.");
-					transaction.delete(columns::HASH_LOOKUP, hash.as_ref());
+					::utils::remove_key_mappings(
+						transaction,
+						columns::KEY_LOOKUP,
+						prune_block,
+						hash
+					);
 					transaction.delete(columns::HEADER, &lookup_key);
 				}
 				prune_block += One::one();
@@ -277,14 +275,40 @@ impl<Block: BlockT> LightStorage<Block> {
 	}
 }
 
+impl<Block> AuxStore for LightStorage<Block>
+	where Block: BlockT,
+{
+	fn insert_aux<
+		'a,
+		'b: 'a,
+		'c: 'a,
+		I: IntoIterator<Item=&'a(&'c [u8], &'c [u8])>,
+		D: IntoIterator<Item=&'a &'b [u8]>,
+	>(&self, insert: I, delete: D) -> ClientResult<()> {
+		let mut transaction = DBTransaction::new();
+		for (k, v) in insert {
+			transaction.put(columns::AUX, k, v);
+		}
+		for k in delete {
+			transaction.delete(columns::AUX, k);
+		}
+		self.db.write(transaction).map_err(db_err)
+	}
+
+	fn get_aux(&self, key: &[u8]) -> ClientResult<Option<Vec<u8>>> {
+		self.db.get(columns::AUX, key).map(|r| r.map(|v| v.to_vec())).map_err(db_err)
+	}
+}
+
 impl<Block> LightBlockchainStorage<Block> for LightStorage<Block>
 	where Block: BlockT,
 {
 	fn import_header(
 		&self,
 		header: Block::Header,
-		authorities: Option<Vec<AuthorityId>>,
+		authorities: Option<Vec<AuthorityIdFor<Block>>>,
 		leaf_state: NewBlockState,
+		aux_ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 	) -> ClientResult<()> {
 		let mut transaction = DBTransaction::new();
 
@@ -292,13 +316,15 @@ impl<Block> LightBlockchainStorage<Block> for LightStorage<Block>
 		let number = *header.number();
 		let parent_hash = *header.parent_hash();
 
-		// blocks in longest chain are keyed by number
-		let lookup_key = if leaf_state.is_best() {
-			::utils::number_to_lookup_key(number).to_vec()
-		} else {
-		// other blocks are keyed by number + hash
-			::utils::number_and_hash_to_lookup_key(number, hash)
-		};
+		for (key, maybe_val) in aux_ops {
+			match maybe_val {
+				Some(val) => transaction.put_vec(columns::AUX, &key, val),
+				None => transaction.delete(columns::AUX, &key),
+			}
+		}
+
+		// blocks are keyed by number + hash.
+		let lookup_key = ::utils::number_and_hash_to_lookup_key(number, hash);
 
 		if leaf_state.is_best() {
 			// handle reorg.
@@ -319,46 +345,45 @@ impl<Block> LightBlockchainStorage<Block> for LightStorage<Block>
 								(&retracted.number, &retracted.hash));
 						}
 
-						let prev_lookup_key = ::utils::number_to_lookup_key(retracted.number);
-						let new_lookup_key = ::utils::number_and_hash_to_lookup_key(retracted.number, retracted.hash);
-
-						// change mapping from `number -> header`
-						// to `number + hash -> header`
-						let retracted_header = if let Some(header) = self.header(BlockId::Number(retracted.number))? {
-							header
-						} else {
-							return Err(::client::error::ErrorKind::UnknownBlock(format!("retracted {:?}", retracted)).into());
-						};
-						transaction.delete(columns::HEADER, &prev_lookup_key);
-						transaction.put(columns::HEADER, &new_lookup_key, &retracted_header.encode());
-
-						transaction.put(columns::HASH_LOOKUP, retracted.hash.as_ref(), &new_lookup_key);
+						::utils::remove_number_to_key_mapping(
+							&mut transaction,
+							columns::KEY_LOOKUP,
+							retracted.number
+						);
 					}
 
 					for enacted in tree_route.enacted() {
-						let prev_lookup_key = ::utils::number_and_hash_to_lookup_key(enacted.number, enacted.hash);
-						let new_lookup_key = ::utils::number_to_lookup_key(enacted.number);
-
-						// change mapping from `number + hash -> header`
-						// to `number -> header`
-						let enacted_header = if let Some(header) = self.header(BlockId::Number(enacted.number))? {
-							header
-						} else {
-							return Err(::client::error::ErrorKind::UnknownBlock(format!("enacted {:?}", enacted)).into());
-						};
-						transaction.delete(columns::HEADER, &prev_lookup_key);
-						transaction.put(columns::HEADER, &new_lookup_key, &enacted_header.encode());
-
-						transaction.put(columns::HASH_LOOKUP, enacted.hash.as_ref(), &new_lookup_key);
+						::utils::insert_number_to_key_mapping(
+							&mut transaction,
+							columns::KEY_LOOKUP,
+							enacted.number,
+							enacted.hash
+						);
 					}
 				}
 			}
 
 			transaction.put(columns::META, meta_keys::BEST_BLOCK, &lookup_key);
+			::utils::insert_number_to_key_mapping(
+				&mut transaction,
+				columns::KEY_LOOKUP,
+				number,
+				hash,
+			);
 		}
 
+		::utils::insert_hash_to_key_mapping(
+			&mut transaction,
+			columns::KEY_LOOKUP,
+			number,
+			hash,
+		);
 		transaction.put(columns::HEADER, &lookup_key, &header.encode());
-		transaction.put(columns::HASH_LOOKUP, hash.as_ref(), &lookup_key);
+
+		if number.is_zero() {
+			transaction.put(columns::META, meta_keys::FINALIZED_BLOCK, &lookup_key);
+			transaction.put(columns::META, meta_keys::GENESIS_HASH, hash.as_ref());
+		}
 
 		let finalized = match leaf_state {
 			NewBlockState::Final => true,
@@ -376,7 +401,7 @@ impl<Block> LightBlockchainStorage<Block> for LightStorage<Block>
 			let mut cache = self.cache.0.write();
 			let cache_ops = cache.transaction(&mut transaction)
 				.on_block_insert(
-					ComplexBlockId::new(*header.parent_hash(), if number == Zero::zero() { Zero::zero() } else { number - One::one() }),
+					ComplexBlockId::new(*header.parent_hash(), if number.is_zero() { Zero::zero() } else { number - One::one() }),
 					ComplexBlockId::new(hash, number),
 					authorities,
 					finalized,
@@ -420,7 +445,7 @@ impl<Block> LightBlockchainStorage<Block> for LightStorage<Block>
 				let mut cache = self.cache.0.write();
 				let cache_ops = cache.transaction(&mut transaction)
 					.on_block_finalize(
-						ComplexBlockId::new(*header.parent_hash(), if number == Zero::zero() { Zero::zero() } else { number - One::one() }),
+						ComplexBlockId::new(*header.parent_hash(), if number.is_zero() { Zero::zero() } else { number - One::one() }),
 						ComplexBlockId::new(hash, number)
 					)?
 					.into_ops();
@@ -448,7 +473,7 @@ impl<Block> LightBlockchainStorage<Block> for LightStorage<Block>
 /// Build the key for inserting header-CHT at given block.
 fn cht_key<N: As<u64>>(cht_type: u8, block: N) -> [u8; 5] {
 	let mut key = [cht_type; 5];
-	key[1..].copy_from_slice(&number_to_lookup_key(block));
+	key[1..].copy_from_slice(&::utils::number_index_key(block));
 	key
 }
 
@@ -485,34 +510,34 @@ pub(crate) mod tests {
 
 	pub fn insert_block<F: Fn() -> Header>(
 		db: &LightStorage<Block>,
-		authorities: Option<Vec<AuthorityId>>,
+		authorities: Option<Vec<AuthorityIdFor<Block>>>,
 		header: F,
 	) -> Hash {
 		let header = header();
 		let hash = header.hash();
-		db.import_header(header, authorities, NewBlockState::Best).unwrap();
+		db.import_header(header, authorities, NewBlockState::Best, Vec::new()).unwrap();
 		hash
 	}
 
 	fn insert_final_block<F: Fn() -> Header>(
 		db: &LightStorage<Block>,
-		authorities: Option<Vec<AuthorityId>>,
+		authorities: Option<Vec<AuthorityIdFor<Block>>>,
 		header: F,
 	) -> Hash {
 		let header = header();
 		let hash = header.hash();
-		db.import_header(header, authorities, NewBlockState::Final).unwrap();
+		db.import_header(header, authorities, NewBlockState::Final, Vec::new()).unwrap();
 		hash
 	}
 
 	fn insert_non_best_block<F: Fn() -> Header>(
 		db: &LightStorage<Block>,
-		authorities: Option<Vec<AuthorityId>>,
+		authorities: Option<Vec<AuthorityIdFor<Block>>>,
 		header: F,
 	) -> Hash {
 		let header = header();
 		let hash = header.hash();
-		db.import_header(header, authorities, NewBlockState::Normal).unwrap();
+		db.import_header(header, authorities, NewBlockState::Normal, Vec::new()).unwrap();
 		hash
 	}
 
@@ -571,11 +596,11 @@ pub(crate) mod tests {
 
 		let genesis_hash = insert_block(&db, None, || default_header(&Default::default(), 0));
 		assert_eq!(db.db.iter(columns::HEADER).count(), 1);
-		assert_eq!(db.db.iter(columns::HASH_LOOKUP).count(), 1);
+		assert_eq!(db.db.iter(columns::KEY_LOOKUP).count(), 2);
 
 		let _ = insert_block(&db, None, || default_header(&genesis_hash, 1));
 		assert_eq!(db.db.iter(columns::HEADER).count(), 2);
-		assert_eq!(db.db.iter(columns::HASH_LOOKUP).count(), 2);
+		assert_eq!(db.db.iter(columns::KEY_LOOKUP).count(), 4);
 	}
 
 	#[test]
@@ -617,9 +642,9 @@ pub(crate) mod tests {
 		// when headers are created without changes tries roots
 		let db = insert_headers(default_header);
 		assert_eq!(db.db.iter(columns::HEADER).count(), (1 + cht::SIZE + 1) as usize);
-		assert_eq!(db.db.iter(columns::HASH_LOOKUP).count(), (1 + cht::SIZE + 1) as usize);
+		assert_eq!(db.db.iter(columns::KEY_LOOKUP).count(), (2 * (1 + cht::SIZE + 1)) as usize);
 		assert_eq!(db.db.iter(columns::CHT).count(), 1);
-		assert!((0..cht::SIZE).all(|i| db.db.get(columns::HEADER, &number_to_lookup_key(1 + i)).unwrap().is_none()));
+		assert!((0..cht::SIZE).all(|i| db.header(BlockId::Number(1 + i)).unwrap().is_none()));
 		assert!(db.header_cht_root(cht::SIZE, cht::SIZE / 2).is_ok());
 		assert!(db.header_cht_root(cht::SIZE, cht::SIZE + cht::SIZE / 2).is_err());
 		assert!(db.changes_trie_cht_root(cht::SIZE, cht::SIZE / 2).is_err());
@@ -629,7 +654,7 @@ pub(crate) mod tests {
 		let db = insert_headers(header_with_changes_trie);
 		assert_eq!(db.db.iter(columns::HEADER).count(), (1 + cht::SIZE + 1) as usize);
 		assert_eq!(db.db.iter(columns::CHT).count(), 2);
-		assert!((0..cht::SIZE).all(|i| db.db.get(columns::HEADER, &number_to_lookup_key(1 + i)).unwrap().is_none()));
+		assert!((0..cht::SIZE).all(|i| db.header(BlockId::Number(1 + i)).unwrap().is_none()));
 		assert!(db.header_cht_root(cht::SIZE, cht::SIZE / 2).is_ok());
 		assert!(db.header_cht_root(cht::SIZE, cht::SIZE + cht::SIZE / 2).is_err());
 		assert!(db.changes_trie_cht_root(cht::SIZE, cht::SIZE / 2).is_ok());
@@ -737,7 +762,7 @@ pub(crate) mod tests {
 	fn authorites_are_cached() {
 		let db = LightStorage::new_test();
 
-		fn run_checks(db: &LightStorage<Block>, max: u64, checks: &[(u64, Option<Vec<AuthorityId>>)]) {
+		fn run_checks(db: &LightStorage<Block>, max: u64, checks: &[(u64, Option<Vec<AuthorityIdFor<Block>>>)]) {
 			for (at, expected) in checks.iter().take_while(|(at, _)| *at <= max) {
 				let actual = db.cache().authorities_at(BlockId::Number(*at));
 				assert_eq!(*expected, actual);
@@ -850,5 +875,42 @@ pub(crate) mod tests {
 			assert_eq!(db.cache().authorities_at(BlockId::Hash(hash6_1_2)), None);
 			assert_eq!(db.cache().authorities_at(BlockId::Hash(hash6_2)), Some(vec![[4u8; 32].into()]));
 		}
+	}
+
+	#[test]
+	fn database_is_reopened() {
+		let db = LightStorage::new_test();
+		let hash0 = insert_final_block(&db, None, || default_header(&Default::default(), 0));
+		assert_eq!(db.info().unwrap().best_hash, hash0);
+		assert_eq!(db.header(BlockId::Hash(hash0)).unwrap().unwrap().hash(), hash0);
+
+		let db = db.db;
+		let db = LightStorage::from_kvdb(db).unwrap();
+		assert_eq!(db.info().unwrap().best_hash, hash0);
+		assert_eq!(db.header(BlockId::Hash::<Block>(hash0)).unwrap().unwrap().hash(), hash0);
+	}
+
+	#[test]
+	fn aux_store_works() {
+		let db = LightStorage::<Block>::new_test();
+
+		// insert aux1 + aux2 using direct store access
+		db.insert_aux(&[(&[1][..], &[101][..]), (&[2][..], &[102][..])], ::std::iter::empty()).unwrap();
+
+		// check aux values
+		assert_eq!(db.get_aux(&[1]).unwrap(), Some(vec![101]));
+		assert_eq!(db.get_aux(&[2]).unwrap(), Some(vec![102]));
+		assert_eq!(db.get_aux(&[3]).unwrap(), None);
+
+		// delete aux1 + insert aux3 using import operation
+		db.import_header(default_header(&Default::default(), 0), None, NewBlockState::Best, vec![
+			(vec![3], Some(vec![103])),
+			(vec![1], None),
+		]).unwrap();
+
+		// check aux values
+		assert_eq!(db.get_aux(&[1]).unwrap(), None);
+		assert_eq!(db.get_aux(&[2]).unwrap(), Some(vec![102]));
+		assert_eq!(db.get_aux(&[3]).unwrap(), Some(vec![103]));
 	}
 }
